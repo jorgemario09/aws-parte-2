@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Workshop CRUD de TODOs + eventos con SNS y SQS (Parte 2)
+
+Globals:
+  Function:
+    Runtime: python3.13
+    CodeUri: src/
+    Timeout: 10
+    MemorySize: 128
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref TodosTable
+        TOPIC_ARN: !Ref TodoEventsTopic
+        AUDIT_TABLE_NAME: !Ref AuditTable
+  Api:
+    Cors:
+      AllowMethods: "'GET, POST, PUT, DELETE, OPTIONS'"
+      AllowHeaders: "'Content-Type'"
+      AllowOrigin: "'*'"
+
+Resources:
+  TodosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: todoId
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: todoId
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  TodoEventsTopic:
+    Type: AWS::SNS::Topic
+
+  AuditDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  AuditQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AuditDLQ.Arn
+        maxReceiveCount: 3
+
+  NotificationsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  NotificationsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationsDLQ.Arn
+        maxReceiveCount: 3
+
+  EventsQueuesPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AuditQueue
+        - !Ref NotificationsQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource:
+              - !GetAtt AuditQueue.Arn
+              - !GetAtt NotificationsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref TodoEventsTopic
+
+  AuditSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref TodoEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt AuditQueue.Arn
+      RawMessageDelivery: true
+
+  NotificationsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref TodoEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationsQueue.Arn
+      RawMessageDelivery: true
+      FilterPolicy:
+        eventType:
+          - todo.completed
+
+  TodosApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+
+  CreateTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: create_todo.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodosTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt TodoEventsTopic.TopicName
+      Events:
+        CreateTodo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodosApi
+            Path: /todos
+            Method: post
+
+  ListTodosFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: list_todos.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TodosTable
+      Events:
+        ListTodos:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodosApi
+            Path: /todos
+            Method: get
+
+  GetTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: get_todo.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TodosTable
+      Events:
+        GetTodo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodosApi
+            Path: /todos/{id}
+            Method: get
+
+  UpdateTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: update_todo.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodosTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt TodoEventsTopic.TopicName
+      Events:
+        UpdateTodo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodosApi
+            Path: /todos/{id}
+            Method: put
+
+  DeleteTodoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: delete_todo.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodosTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt TodoEventsTopic.TopicName
+      Events:
+        DeleteTodo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodosApi
+            Path: /todos/{id}
+            Method: delete
+
+  GetHistoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: get_history.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AuditTable
+      Events:
+        GetHistory:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodosApi
+            Path: /todos/{id}/history
+            Method: get
+
+  AuditFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: audit_consumer.handler
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref AuditTable
+      Events:
+        AuditQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AuditQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: notify_consumer.handler
+      Events:
+        NotificationsQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt NotificationsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+Outputs:
+  ApiUrl:
+    Description: URL base del recurso /todos
+    Value: !Sub "https://${TodosApi}.execute-api.${AWS::Region}.amazonaws.com/dev/todos"
+  TableName:
+    Description: Nombre de la tabla DynamoDB de Todos
+    Value: !Ref TodosTable
+  TopicArn:
+    Description: ARN del topic SNS de eventos
+    Value: !Ref TodoEventsTopic
+  AuditTableName:
+    Description: Nombre de la tabla de auditoría
+    Value: !Ref AuditTable
+  AuditQueueUrl:
+    Value: !Ref AuditQueue
+  NotificationsQueueUrl:
+    Value: !Ref NotificationsQueue
+  NotificationsDLQUrl:
+    Value: !Ref NotificationsDLQ
+  NotificationsDLQArn:
+    Value: !GetAtt NotificationsDLQ.Arn
